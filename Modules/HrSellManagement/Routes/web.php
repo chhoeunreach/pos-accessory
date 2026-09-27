@@ -1,0 +1,35 @@
+<?php
+
+use Illuminate\Support\Facades\Route;
+
+Route::middleware(['web', 'auth'])->prefix('hr-sell')->as('hr-sell.')->group(function () {
+    Route::get('/install', ['\Modules\HrSellManagement\Http\Controllers\InstallController', 'install'])->name('install');
+});
+
+Route::middleware(['web', 'auth', 'SetSessionData', 'language', 'timezone', 'AdminSidebarMenu', 'CheckUserLogin'])
+    ->prefix('hr-sell')
+    ->as('hr-sell.')
+    ->group(function () {
+        Route::get('/', ['\Modules\HrSellManagement\Http\Controllers\DashboardController', 'index'])->name('dashboard');
+        Route::get('/sales-traffic', ['\Modules\HrSellManagement\Http\Controllers\DashboardController', 'salesTraffic'])->name('dashboard.sales_traffic');
+        Route::get('/sales', ['\Modules\HrSellManagement\Http\Controllers\HrSellController', 'index'])->name('sales.index');
+        Route::post('/sales/link', ['\Modules\HrSellManagement\Http\Controllers\HrSellController', 'link'])->name('sales.link');
+        Route::get('/sales/pos-detail/{report_id}', ['\Modules\HrSellManagement\Http\Controllers\HrSellController', 'posDetail'])->name('sales.pos_detail');
+        Route::get('/sales/pos-photo/{photo_id}', ['\Modules\HrSellManagement\Http\Controllers\HrSellController', 'posPhoto'])->name('sales.pos_photo');
+        Route::get('/sales/{hrSell}', ['\Modules\HrSellManagement\Http\Controllers\HrSellController', 'show'])->name('sales.show');
+        Route::post('/sales/{hrSell}', ['\Modules\HrSellManagement\Http\Controllers\HrSellController', 'update'])->name('sales.update');
+        Route::post('/sales/{hrSell}/approve', ['\Modules\HrSellManagement\Http\Controllers\HrSellController', 'approve'])->name('sales.approve');
+        Route::post('/sales/{hrSell}/notes', ['\Modules\HrSellManagement\Http\Controllers\HrSellController', 'storeNote'])->name('sales.notes.store');
+        Route::get('/reports', ['\Modules\HrSellManagement\Http\Controllers\ReportController', 'index'])->name('reports.index');
+        Route::get('/reports/export', ['\Modules\HrSellManagement\Http\Controllers\ReportController', 'export'])->name('reports.export');
+        Route::get('/reports/staff', ['\Modules\HrSellManagement\Http\Controllers\ReportController', 'staff'])->name('reports.staff');
+        Route::get('/reports/staff/export', ['\Modules\HrSellManagement\Http\Controllers\ReportController', 'staffExport'])->name('reports.staff.export');
+        Route::get('/reports/commission/export', ['\Modules\HrSellManagement\Http\Controllers\ReportController', 'commissionExport'])->name('reports.commission.export');
+        Route::get('/reports/commission', ['\Modules\HrSellManagement\Http\Controllers\ReportController', 'commission'])->name('reports.commission');
+        Route::delete('/reports/lines/{line_id}', ['\Modules\HrSellManagement\Http\Controllers\ReportController', 'destroyLine'])->name('reports.lines.destroy');
+        Route::get('/reports/{report_id}/edit', ['\Modules\HrSellManagement\Http\Controllers\ReportController', 'edit'])->name('reports.edit');
+        Route::put('/reports/{report_id}', ['\Modules\HrSellManagement\Http\Controllers\ReportController', 'update'])->name('reports.update');
+        Route::delete('/reports/{report_id}', ['\Modules\HrSellManagement\Http\Controllers\ReportController', 'destroy'])->name('reports.destroy');
+        Route::get('/settings', ['\Modules\HrSellManagement\Http\Controllers\SettingsController', 'index'])->name('settings.index');
+        Route::post('/settings', ['\Modules\HrSellManagement\Http\Controllers\SettingsController', 'update'])->name('settings.update');
+    });

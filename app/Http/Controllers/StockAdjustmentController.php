@@ -1,0 +1,916 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\BusinessLocation;
+use App\PurchaseLine;
+use App\Transaction;
+use App\User;
+use App\Variation;
+use App\Utils\ModuleUtil;
+use App\Utils\ProductUtil;
+use App\Utils\TransactionUtil;
+use Datatables;
+use DB;
+use Illuminate\Http\Request;
+use Maatwebsite\Excel\Facades\Excel;
+use Spatie\Activitylog\Models\Activity;
+use App\Events\StockAdjustmentCreatedOrModified;
+
+class StockAdjustmentController extends Controller
+{
+    /**
+     * All Utils instance.
+     */
+    protected $productUtil;
+
+    protected $transactionUtil;
+
+    protected $moduleUtil;
+
+    /**
+     * Constructor
+     *
+     * @param  ProductUtils  $product
+     * @return void
+     */
+    public function __construct(ProductUtil $productUtil, TransactionUtil $transactionUtil, ModuleUtil $moduleUtil)
+    {
+        $this->productUtil = $productUtil;
+        $this->transactionUtil = $transactionUtil;
+        $this->moduleUtil = $moduleUtil;
+    }
+
+    /**
+     * Display a listing of the resource.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function index()
+    {
+
+        if (! auth()->user()->can('stock_adjustment.view') && ! auth()->user()->can('stock_adjustment.create') && ! auth()->user()->can('view_own_stock_adjustment')) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        if (request()->ajax()) {
+            $business_id = request()->session()->get('user.business_id');
+
+            $stock_adjustments = Transaction::join(
+                'business_locations AS BL',
+                'transactions.location_id',
+                '=',
+                'BL.id'
+            )
+                ->leftJoin('users as u', 'transactions.created_by', '=', 'u.id')
+                    ->where('transactions.business_id', $business_id)
+                    ->where('transactions.type', 'stock_adjustment')
+                    ->select(
+                        'transactions.id',
+                        'transaction_date',
+                        'ref_no',
+                        'BL.name as location_name',
+                        'adjustment_type',
+                        'final_total',
+                        'total_amount_recovered',
+                        'additional_notes',
+                        'transactions.id as DT_RowId',
+                        DB::raw("CONCAT(COALESCE(u.surname, ''),' ',COALESCE(u.first_name, ''),' ',COALESCE(u.last_name,'')) as added_by")
+                    );
+
+            $permitted_locations = auth()->user()->permitted_locations();
+            if ($permitted_locations != 'all') {
+                $stock_adjustments->whereIn('transactions.location_id', $permitted_locations);
+            }
+
+            $hide = '';
+            $start_date = request()->get('start_date');
+            $end_date = request()->get('end_date');
+            if (! empty($start_date) && ! empty($end_date)) {
+                $stock_adjustments->whereBetween(DB::raw('date(transaction_date)'), [$start_date, $end_date]);
+            }
+            $location_id = request()->get('location_id');
+            if (! empty($location_id)) {
+                $stock_adjustments->where('transactions.location_id', $location_id);
+            }
+
+            $adjustment_type = request()->get('adjustment_type');
+            if (! empty($adjustment_type)) {
+                $stock_adjustments->where('transactions.adjustment_type', $adjustment_type);
+            }
+
+            $created_by = request()->get('created_by');
+            if (! empty($created_by)) {
+                $stock_adjustments->where('transactions.created_by', $created_by);
+            }
+
+            $ref_no = trim((string) request()->get('ref_no', ''));
+            if ($ref_no !== '') {
+                $stock_adjustments->where('transactions.ref_no', 'like', '%' . $ref_no . '%');
+            }
+
+            $product_id = request()->get('product_id');
+            if (! empty($product_id)) {
+                $stock_adjustments->whereExists(function ($q) use ($product_id) {
+                    $q->select(DB::raw(1))
+                        ->from('stock_adjustment_lines as sal')
+                        ->whereColumn('sal.transaction_id', 'transactions.id')
+                        ->where('sal.product_id', $product_id);
+                });
+            }
+
+            if (! auth()->user()->can('stock_adjustment.view') && auth()->user()->can('view_own_stock_adjustment')) {
+                $stock_adjustments->where('transactions.created_by', request()->session()->get('user.id'));
+            }
+
+            if(! auth()->user()->can('stock_adjustment.delete')){
+                $hide = 'hide';
+            }
+
+            return Datatables::of($stock_adjustments)
+                ->addColumn('action', '<button type="button" data-href="{{action([\App\Http\Controllers\StockAdjustmentController::class, \'show\'], [$id]) }}" class="tw-dw-btn tw-dw-btn-xs tw-dw-btn-outline  tw-dw-btn-primary btn-modal" data-container=".view_modal"><i class="fa fa-eye" aria-hidden="true"></i> @lang("messages.view")</button>
+                 &nbsp;
+                    <button type="button" data-href="{{  action([\App\Http\Controllers\StockAdjustmentController::class, \'destroy\'], [$id]) }}" class="tw-dw-btn tw-dw-btn-xs tw-dw-btn-outline  tw-dw-btn-error delete_stock_adjustment '.$hide.'"><i class="fa fa-trash" aria-hidden="true"></i> @lang("messages.delete")</button>')
+                ->removeColumn('id')
+                ->editColumn(
+                    'final_total',
+                    function ($row) {
+                        if (auth()->user()->can('view_purchase_price')) {
+                            return $this->transactionUtil->num_f($row->final_total, true);                     
+                         } else {
+                            return '<span>-</span>';
+                        }
+                        
+                    }
+                )
+
+                ->editColumn(
+                    'total_amount_recovered',
+                    function ($row) {
+                        if (auth()->user()->can('view_purchase_price')) {
+                            return $this->transactionUtil->num_f($row->total_amount_recovered, true);                    
+                         } else {
+                            return '<span>-</span>';
+                        }
+                    }
+                )
+                ->editColumn('transaction_date', '{{@format_datetime($transaction_date)}}')
+                ->editColumn('adjustment_type', function ($row) {
+                    return __('stock_adjustment.'.$row->adjustment_type);
+                })
+                ->setRowAttr([
+                    'data-href' => function ($row) {
+                        return  action([\App\Http\Controllers\StockAdjustmentController::class, 'show'], [$row->id]);
+                    }, ])
+                ->rawColumns(['final_total', 'action', 'total_amount_recovered'])
+                ->make(true);
+        }
+
+        $business_id = request()->session()->get('user.business_id');
+        $business_locations = BusinessLocation::forDropdown($business_id);
+        $users = User::forDropdown($business_id, false, false, true);
+        $adjustment_types = [
+            'normal' => __('stock_adjustment.normal'),
+            'abnormal' => __('stock_adjustment.abnormal'),
+        ];
+
+        return view('stock_adjustment.index')->with(compact('business_locations', 'users', 'adjustment_types'));
+    }
+
+    /**
+     * Show the form for creating a new resource.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function create()
+    {
+        if (! auth()->user()->can('stock_adjustment.create')) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $business_id = request()->session()->get('user.business_id');
+
+        //Check if subscribed or not
+        if (! $this->moduleUtil->isSubscribed($business_id)) {
+            return $this->moduleUtil->expiredResponse(action([\App\Http\Controllers\StockAdjustmentController::class, 'index']));
+        }
+
+        $business_locations = BusinessLocation::forDropdown($business_id);
+
+        return view('stock_adjustment.create')
+                ->with(compact('business_locations'));
+    }
+
+    /**
+     * Download CSV import template for stock adjustment lines.
+     */
+    public function downloadImportTemplate()
+    {
+        if (! auth()->user()->can('stock_adjustment.create')) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $headers = [
+            'Content-Type' => 'text/csv; charset=UTF-8',
+            'Content-Disposition' => 'attachment; filename="stock-adjustment-import-template.csv"',
+        ];
+
+        $columns = ['sku', 'lot_number', 'quantity', 'adjustment_type', 'note'];
+        $sample = ['SKU-OR-SUBSKU-HERE', 'LOT-123 (optional)', '1', 'damaged (optional)', 'optional note'];
+
+        $callback = function () use ($columns, $sample) {
+            $out = fopen('php://output', 'w');
+            // UTF-8 BOM for Excel compatibility
+            fprintf($out, chr(0xEF).chr(0xBB).chr(0xBF));
+            fputcsv($out, $columns);
+            fputcsv($out, $sample);
+            fclose($out);
+        };
+
+        return response()->stream($callback, 200, $headers);
+    }
+
+    /**
+     * Import stock adjustment lines (preview only) by SKU and/or Lot Number.
+     * Loads valid items into the create form via JS; does not save transactions.
+     *
+     * Expected columns (by position):
+     * 0: SKU (optional)
+     * 1: Lot Number (optional)
+     * 2: Quantity (required)
+     * 3: Adjustment Type (optional) - normal/damaged/expired/lost
+     * 4: Note (optional)
+     */
+    public function importAdjustmentProducts(Request $request)
+    {
+        try {
+            if (! auth()->user()->can('stock_adjustment.create')) {
+                abort(403, 'Unauthorized action.');
+            }
+
+            if (! $request->ajax()) {
+                abort(404);
+            }
+
+            $request->validate([
+                'file' => 'required|file',
+                'location_id' => 'required',
+            ]);
+
+            $business_id = $request->session()->get('user.business_id');
+            $location_id = $request->input('location_id');
+
+            $file = $request->file('file');
+            $parsed_array = Excel::toArray([], $file);
+
+            if (empty($parsed_array) || empty($parsed_array[0])) {
+                return [
+                    'success' => false,
+                    'msg' => __('messages.something_went_wrong'),
+                ];
+            }
+
+            // Remove header row only if it looks like a header
+            $sheet = $parsed_array[0];
+            $first_row = $sheet[0] ?? [];
+            $first_row_normalized = array_map(function ($v) {
+                return strtolower(trim((string) $v));
+            }, $first_row);
+            $looks_like_header = in_array('sku', $first_row_normalized) || in_array('lot_number', $first_row_normalized) || in_array('quantity', $first_row_normalized);
+            $imported_data = $looks_like_header ? array_splice($sheet, 1) : $sheet;
+
+            $allowed_line_types = ['normal', 'damaged', 'expired', 'lost'];
+
+            $errors = [];
+            $raw_success_lines = [];
+            foreach ($imported_data as $index => $row) {
+                $row_number = $looks_like_header ? ($index + 2) : ($index + 1);
+
+                $sku = isset($row[0]) ? trim((string) $row[0]) : '';
+                $lot_number = isset($row[1]) ? trim((string) $row[1]) : '';
+                $quantity_raw = $row[2] ?? null;
+                $line_type = isset($row[3]) ? strtolower(trim((string) $row[3])) : '';
+                $note = isset($row[4]) ? trim((string) $row[4]) : '';
+
+                if (empty($sku) && empty($lot_number)) {
+                    $errors[] = [
+                        'row' => $row_number,
+                        'sku' => $sku,
+                        'lot_number' => $lot_number,
+                        'quantity' => $quantity_raw,
+                        'adjustment_type' => $line_type,
+                        'note' => $note,
+                        'match_by' => null,
+                        'error' => 'SKU or Lot Number is required.',
+                    ];
+                    continue;
+                }
+
+                if ($quantity_raw === null || $quantity_raw === '' || ! is_numeric($quantity_raw) || (float) $quantity_raw <= 0) {
+                    $errors[] = [
+                        'row' => $row_number,
+                        'sku' => $sku,
+                        'lot_number' => $lot_number,
+                        'quantity' => $quantity_raw,
+                        'adjustment_type' => $line_type,
+                        'note' => $note,
+                        'match_by' => ! empty($lot_number) ? 'lot' : 'sku',
+                        'error' => 'Quantity is required and must be greater than 0.',
+                    ];
+                    continue;
+                }
+
+                if (! empty($line_type) && ! in_array($line_type, $allowed_line_types)) {
+                    $errors[] = [
+                        'row' => $row_number,
+                        'sku' => $sku,
+                        'lot_number' => $lot_number,
+                        'quantity' => $quantity_raw,
+                        'adjustment_type' => $line_type,
+                        'note' => $note,
+                        'match_by' => ! empty($lot_number) ? 'lot' : 'sku',
+                        'error' => 'Invalid adjustment_type. Allowed: ' . implode(', ', $allowed_line_types) . '.',
+                    ];
+                    continue;
+                }
+
+                $qty = (float) $quantity_raw;
+
+                // Prefer lot if provided
+                if (! empty($lot_number)) {
+                    $purchase_line = PurchaseLine::join('transactions as T', 'purchase_lines.transaction_id', '=', 'T.id')
+                        ->where('T.business_id', $business_id)
+                        ->where('T.location_id', $location_id)
+                        ->whereNotNull('purchase_lines.lot_number')
+                        ->where('purchase_lines.lot_number', $lot_number)
+                        ->whereRaw('(purchase_lines.quantity_sold + purchase_lines.quantity_adjusted + purchase_lines.quantity_returned) < purchase_lines.quantity')
+                        ->select(
+                            'purchase_lines.id as purchase_line_id',
+                            'purchase_lines.product_id',
+                            'purchase_lines.variation_id',
+                            'purchase_lines.lot_number',
+                            DB::raw('(purchase_lines.quantity - (purchase_lines.quantity_sold + purchase_lines.quantity_adjusted + purchase_lines.quantity_returned)) AS qty_available')
+                        )
+                        ->orderByDesc(DB::raw('(purchase_lines.quantity - (purchase_lines.quantity_sold + purchase_lines.quantity_adjusted + purchase_lines.quantity_returned))'))
+                        ->first();
+
+                    if (empty($purchase_line)) {
+                        $errors[] = [
+                            'row' => $row_number,
+                            'sku' => $sku,
+                            'lot_number' => $lot_number,
+                            'quantity' => $qty,
+                            'adjustment_type' => $line_type,
+                            'note' => $note,
+                            'match_by' => 'lot',
+                            'error' => 'Lot number not found in selected location.',
+                        ];
+                        continue;
+                    }
+
+                    if ($qty > (float) $purchase_line->qty_available) {
+                        $errors[] = [
+                            'row' => $row_number,
+                            'sku' => $sku,
+                            'lot_number' => $lot_number,
+                            'quantity' => $qty,
+                            'adjustment_type' => $line_type,
+                            'note' => $note,
+                            'match_by' => 'lot',
+                            'error' => 'Quantity exceeds available stock in this lot.',
+                        ];
+                        continue;
+                    }
+
+                    // Validate variation exists & is for this business (defensive)
+                    try {
+                        $this->productUtil->getDetailsFromVariation($purchase_line->variation_id, $business_id, $location_id, true, true);
+                    } catch (\Exception $e) {
+                        $errors[] = [
+                            'row' => $row_number,
+                            'sku' => $sku,
+                            'lot_number' => $lot_number,
+                            'quantity' => $qty,
+                            'adjustment_type' => $line_type,
+                            'note' => $note,
+                            'match_by' => 'lot',
+                            'error' => 'Product for this lot could not be loaded.',
+                        ];
+                        continue;
+                    }
+
+                    $raw_success_lines[] = [
+                        'variation_id' => (int) $purchase_line->variation_id,
+                        'quantity' => $qty,
+                        'lot_no_line_id' => (int) $purchase_line->purchase_line_id,
+                        'note' => $note,
+                        'adjustment_type' => $line_type,
+                        'match_by' => 'lot',
+                        'sku' => $sku,
+                        'lot_number' => $lot_number,
+                    ];
+                    continue;
+                }
+
+                // SKU match (sub_sku preferred)
+                $sku_value = $sku;
+                $variation = Variation::where('sub_sku', $sku_value)
+                    ->join('products as p', 'p.id', '=', 'variations.product_id')
+                    ->where('p.business_id', $business_id)
+                    ->select('variations.*')
+                    ->first();
+
+                if (empty($variation)) {
+                    // Try product sku -> first variation
+                    $variation = Variation::join('products as p', 'p.id', '=', 'variations.product_id')
+                        ->where('p.business_id', $business_id)
+                        ->where('p.sku', $sku_value)
+                        ->select('variations.*')
+                        ->first();
+                }
+
+                if (empty($variation)) {
+                    $errors[] = [
+                        'row' => $row_number,
+                        'sku' => $sku,
+                        'lot_number' => $lot_number,
+                        'quantity' => $qty,
+                        'adjustment_type' => $line_type,
+                        'note' => $note,
+                        'match_by' => 'sku',
+                        'error' => 'Product not found for SKU.',
+                    ];
+                    continue;
+                }
+
+                $product_details = $this->productUtil->getDetailsFromVariation($variation->id, $business_id, $location_id, true, true);
+                if ($product_details->enable_stock == 1 && $qty > (float) $product_details->qty_available) {
+                    $errors[] = [
+                        'row' => $row_number,
+                        'sku' => $sku,
+                        'lot_number' => $lot_number,
+                        'quantity' => $qty,
+                        'adjustment_type' => $line_type,
+                        'note' => $note,
+                        'match_by' => 'sku',
+                        'error' => 'Quantity exceeds available stock in selected location.',
+                    ];
+                    continue;
+                }
+
+                $raw_success_lines[] = [
+                    'variation_id' => (int) $variation->id,
+                    'quantity' => $qty,
+                    'lot_no_line_id' => null,
+                    'note' => $note,
+                    'adjustment_type' => $line_type,
+                    'match_by' => 'sku',
+                    'sku' => $sku,
+                    'lot_number' => $lot_number,
+                ];
+            }
+
+            // Merge duplicates: same variation + same lot (or both null)
+            $merged = [];
+            foreach ($raw_success_lines as $line) {
+                $key = $line['variation_id'] . ':' . (! empty($line['lot_no_line_id']) ? $line['lot_no_line_id'] : 0);
+                if (! isset($merged[$key])) {
+                    $merged[$key] = $line;
+                } else {
+                    $merged[$key]['quantity'] += $line['quantity'];
+
+                    if (empty($merged[$key]['adjustment_type']) && ! empty($line['adjustment_type'])) {
+                        $merged[$key]['adjustment_type'] = $line['adjustment_type'];
+                    }
+
+                    if (! empty($line['note'])) {
+                        $existing = trim((string) ($merged[$key]['note'] ?? ''));
+                        $merged[$key]['note'] = trim($existing . (empty($existing) ? '' : "\n") . $line['note']);
+                    }
+                }
+            }
+
+            $success_lines = array_values($merged);
+
+            // Re-validate merged quantities against available stock
+            $final_success = [];
+            foreach ($success_lines as $line) {
+                if (! empty($line['lot_no_line_id'])) {
+                    $pl = PurchaseLine::join('transactions as T', 'purchase_lines.transaction_id', '=', 'T.id')
+                        ->where('T.business_id', $business_id)
+                        ->where('T.location_id', $location_id)
+                        ->where('purchase_lines.id', $line['lot_no_line_id'])
+                        ->select(
+                            'purchase_lines.id as purchase_line_id',
+                            DB::raw('(purchase_lines.quantity - (purchase_lines.quantity_sold + purchase_lines.quantity_adjusted + purchase_lines.quantity_returned)) AS qty_available')
+                        )
+                        ->first();
+
+                    if (empty($pl) || (float) $line['quantity'] > (float) $pl->qty_available) {
+                        $errors[] = [
+                            'row' => null,
+                            'sku' => $line['sku'] ?? '',
+                            'lot_number' => $line['lot_number'] ?? '',
+                            'quantity' => $line['quantity'],
+                            'adjustment_type' => $line['adjustment_type'] ?? '',
+                            'note' => $line['note'] ?? '',
+                            'match_by' => 'lot',
+                            'error' => 'Merged quantity exceeds available stock in this lot.',
+                        ];
+                        continue;
+                    }
+                } else {
+                    $product_details = $this->productUtil->getDetailsFromVariation($line['variation_id'], $business_id, $location_id, true, true);
+                    if ($product_details->enable_stock == 1 && (float) $line['quantity'] > (float) $product_details->qty_available) {
+                        $errors[] = [
+                            'row' => null,
+                            'sku' => $line['sku'] ?? '',
+                            'lot_number' => '',
+                            'quantity' => $line['quantity'],
+                            'adjustment_type' => $line['adjustment_type'] ?? '',
+                            'note' => $line['note'] ?? '',
+                            'match_by' => 'sku',
+                            'error' => 'Merged quantity exceeds available stock in selected location.',
+                        ];
+                        continue;
+                    }
+                }
+
+                $final_success[] = $line;
+            }
+
+            return [
+                'success' => true,
+                'summary' => [
+                    'total_rows' => count($imported_data),
+                    'success' => count($final_success),
+                    'failed' => count($errors),
+                ],
+                'valid_rows' => $final_success,
+                'error_rows' => $errors,
+            ];
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            throw $e;
+        } catch (\Exception $e) {
+            \Log::emergency('File:'.$e->getFile().'Line:'.$e->getLine().'Message:'.$e->getMessage());
+            return [
+                'success' => false,
+                'msg' => $e->getMessage(),
+            ];
+        }
+    }
+
+    /**
+     * Store a newly created resource in storage.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return \Illuminate\Http\Response
+     */
+    public function store(Request $request)
+    {
+        if (! auth()->user()->can('stock_adjustment.create')) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        try {
+            DB::beginTransaction();
+
+            $input_data = $request->only(['location_id', 'transaction_date', 'adjustment_type', 'additional_notes', 'total_amount_recovered', 'final_total', 'ref_no']);
+            $business_id = $request->session()->get('user.business_id');
+
+            //Check if subscribed or not
+            if (! $this->moduleUtil->isSubscribed($business_id)) {
+                return $this->moduleUtil->expiredResponse(action([\App\Http\Controllers\StockAdjustmentController::class, 'index']));
+            }
+
+            $user_id = $request->session()->get('user.id');
+
+            $input_data['type'] = 'stock_adjustment';
+            $input_data['status'] = 'final';
+            $input_data['business_id'] = $business_id;
+            $input_data['created_by'] = $user_id;
+            $input_data['transaction_date'] = $this->productUtil->uf_date($input_data['transaction_date'], true);
+            $input_data['total_amount_recovered'] = $this->productUtil->num_uf($input_data['total_amount_recovered']);
+
+            //Update reference count
+            $ref_count = $this->productUtil->setAndGetReferenceCount('stock_adjustment');
+            //Generate reference number
+            if (empty($input_data['ref_no'])) {
+                $input_data['ref_no'] = $this->productUtil->generateReferenceNumber('stock_adjustment', $ref_count);
+            }
+
+            $products = $request->input('products');
+
+            if (! empty($products)) {
+                $product_data = [];
+
+                foreach ($products as $product) {
+                    $adjustment_line = [
+                        'product_id' => $product['product_id'],
+                        'variation_id' => $product['variation_id'],
+                        'quantity' => $this->productUtil->num_uf($product['quantity']),
+                        'unit_price' => $this->productUtil->num_uf($product['unit_price']),
+                    ];
+                    if (! empty($product['lot_no_line_id'])) {
+                        //Add lot_no_line_id to stock adjustment line
+                        $adjustment_line['lot_no_line_id'] = $product['lot_no_line_id'];
+                    }
+                    $product_data[] = $adjustment_line;
+
+                    //Decrease available quantity
+                    $this->productUtil->decreaseProductQuantity(
+                        $product['product_id'],
+                        $product['variation_id'],
+                        $input_data['location_id'],
+                        $this->productUtil->num_uf($product['quantity'])
+                    );
+                }
+
+                $stock_adjustment = Transaction::create($input_data);
+                $stock_adjustment->stock_adjustment_lines()->createMany($product_data);
+
+                //Map Stock adjustment & Purchase.
+                $business = ['id' => $business_id,
+                    'accounting_method' => $request->session()->get('business.accounting_method'),
+                    'location_id' => $input_data['location_id'],
+                ];
+                $this->transactionUtil->mapPurchaseSell($business, $stock_adjustment->stock_adjustment_lines, 'stock_adjustment');
+
+                event(new StockAdjustmentCreatedOrModified($stock_adjustment, 'added'));
+
+                $this->transactionUtil->activityLog($stock_adjustment, 'added', null, [], false);
+            }
+
+            $output = ['success' => 1,
+                'msg' => __('stock_adjustment.stock_adjustment_added_successfully'),
+            ];
+
+            DB::commit();
+        } catch (\Exception $e) {
+            DB::rollBack();
+
+            \Log::emergency('File:'.$e->getFile().'Line:'.$e->getLine().'Message:'.$e->getMessage());
+            $msg = trans('messages.something_went_wrong');
+
+            if (get_class($e) == \App\Exceptions\PurchaseSellMismatch::class) {
+                $msg = $e->getMessage();
+            }
+
+            $output = ['success' => 0,
+                'msg' => $msg,
+            ];
+        }
+
+        return redirect('stock-adjustments')->with('status', $output);
+    }
+
+    /**
+     * Display the specified resource.
+     *
+     * @param  int  $id
+     * @return \Illuminate\Http\Response
+     */
+    public function show($id)
+    {
+        if (! auth()->user()->can('stock_adjustment.view')) {
+            abort(403, 'Unauthorized action.');
+        }
+        $business_id = request()->session()->get('user.business_id');
+        $stock_adjustment = Transaction::where('transactions.business_id', $business_id)
+                    ->where('transactions.id', $id)
+                    ->where('transactions.type', 'stock_adjustment')
+                    ->with(['stock_adjustment_lines', 'location', 'business', 'stock_adjustment_lines.variation', 'stock_adjustment_lines.variation.product', 'stock_adjustment_lines.variation.product_variation', 'stock_adjustment_lines.lot_details'])
+                    ->first();
+
+        $lot_n_exp_enabled = false;
+        if (request()->session()->get('business.enable_lot_number') == 1 || request()->session()->get('business.enable_product_expiry') == 1) {
+            $lot_n_exp_enabled = true;
+        }
+
+        $activities = Activity::forSubject($stock_adjustment)
+           ->with(['causer', 'subject'])
+           ->latest()
+           ->get();
+
+        return view('stock_adjustment.show')
+                ->with(compact('stock_adjustment', 'lot_n_exp_enabled', 'activities'));
+    }
+
+    /**
+     * Show the form for editing the specified resource.
+     *
+     * @param  \App\Transaction  $stockAdjustment
+     * @return \Illuminate\Http\Response
+     */
+    public function edit(Transaction $stockAdjustment)
+    {
+        //
+    }
+
+    /**
+     * Update the specified resource in storage.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @param  \App\Transaction  $stockAdjustment
+     * @return \Illuminate\Http\Response
+     */
+    public function update(Request $request, Transaction $stockAdjustment)
+    {
+        //
+    }
+
+    /**
+     * Remove the specified resource from storage.
+     *
+     * @param  int  $id
+     * @return \Illuminate\Http\Response
+     */
+    public function destroy($id)
+    {
+        if (! auth()->user()->can('stock_adjustment.delete')) {
+            abort(403, 'Unauthorized action.');
+        }
+        try {
+            if (request()->ajax()) {
+                DB::beginTransaction();
+
+                $stock_adjustment = Transaction::where('id', $id)
+                                    ->where('type', 'stock_adjustment')
+                                    ->with(['stock_adjustment_lines'])
+                                    ->first();
+
+                //Add deleted product quantity to available quantity
+                $stock_adjustment_lines = $stock_adjustment->stock_adjustment_lines;
+                if (! empty($stock_adjustment_lines)) {
+                    $line_ids = [];
+                    foreach ($stock_adjustment_lines as $stock_adjustment_line) {
+                        $this->productUtil->updateProductQuantity(
+                            $stock_adjustment->location_id,
+                            $stock_adjustment_line->product_id,
+                            $stock_adjustment_line->variation_id,
+                            $this->productUtil->num_f($stock_adjustment_line->quantity)
+                        );
+                        $line_ids[] = $stock_adjustment_line->id;
+                    }
+
+                    $this->transactionUtil->mapPurchaseQuantityForDeleteStockAdjustment($line_ids);
+                }
+                $stock_adjustment->delete();
+
+                event( new StockAdjustmentCreatedOrModified($stock_adjustment, 'deleted'));
+
+
+                //Remove Mapping between stock adjustment & purchase.
+
+                $output = ['success' => 1,
+                    'msg' => __('stock_adjustment.delete_success'),
+                ];
+
+                DB::commit();
+            }
+        } catch (\Exception $e) {
+            DB::rollBack();
+            \Log::emergency('File:'.$e->getFile().'Line:'.$e->getLine().'Message:'.$e->getMessage());
+
+            $output = ['success' => 0,
+                'msg' => __('messages.something_went_wrong'),
+            ];
+        }
+
+        return $output;
+    }
+
+    /**
+     * Return product rows
+     *
+     * @param  Request  $request
+     * @return \Illuminate\Http\Response
+     */
+    public function getProductRow(Request $request)
+    {
+        if (request()->ajax()) {
+            $row_index = $request->input('row_index');
+            $variation_id = $request->input('variation_id');
+            $location_id = $request->input('location_id');
+
+            $business_id = $request->session()->get('user.business_id');
+            $product = $this->productUtil->getDetailsFromVariation($variation_id, $business_id, $location_id);
+            $product->formatted_qty_available = $this->productUtil->num_f($product->qty_available);
+            $type = ! empty($request->input('type')) ? $request->input('type') : 'stock_adjustment';
+
+            //Get lot number dropdown if enabled
+            $lot_numbers = [];
+            if (request()->session()->get('business.enable_lot_number') == 1 || request()->session()->get('business.enable_product_expiry') == 1) {
+                $lot_number_obj = $this->transactionUtil->getLotNumbersFromVariation($variation_id, $business_id, $location_id, true);
+                foreach ($lot_number_obj as $lot_number) {
+                    $lot_number->qty_formated = $this->productUtil->num_f($lot_number->qty_available);
+                    $lot_numbers[] = $lot_number;
+                }
+            }
+            $product->lot_numbers = $lot_numbers;
+
+            $sub_units = $this->productUtil->getSubUnits($business_id, $product->unit_id, false, $product->id);
+            if ($type == 'stock_transfer') {
+                return view('stock_transfer.partials.product_table_row')
+                    ->with(compact('product', 'row_index', 'sub_units'));
+            } else {
+                return view('stock_adjustment.partials.product_table_row')
+                        ->with(compact('product', 'row_index', 'sub_units'));
+            }
+        }
+    }
+
+    /**
+     * Sets expired purchase line as stock adjustmnet
+     *
+     * @param  int  $purchase_line_id
+     * @return json $output
+     */
+    public function removeExpiredStock($purchase_line_id)
+    {
+        if (! auth()->user()->can('stock_adjustment.delete')) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        try {
+            $purchase_line = PurchaseLine::where('id', $purchase_line_id)
+                                    ->with(['transaction'])
+                                    ->first();
+
+            if (! empty($purchase_line)) {
+                DB::beginTransaction();
+
+                $qty_unsold = $purchase_line->quantity - $purchase_line->quantity_sold - $purchase_line->quantity_adjusted - $purchase_line->quantity_returned;
+                $final_total = $purchase_line->purchase_price_inc_tax * $qty_unsold;
+
+                $user_id = request()->session()->get('user.id');
+                $business_id = request()->session()->get('user.business_id');
+
+                //Update reference count
+                $ref_count = $this->productUtil->setAndGetReferenceCount('stock_adjustment');
+
+                $stock_adjstmt_data = [
+                    'type' => 'stock_adjustment',
+                    'status' => 'final',
+                    'business_id' => $business_id,
+                    'created_by' => $user_id,
+                    'transaction_date' => \Carbon::now()->format('Y-m-d'),
+                    'total_amount_recovered' => 0,
+                    'location_id' => $purchase_line->transaction->location_id,
+                    'adjustment_type' => 'normal',
+                    'final_total' => $final_total,
+                    'ref_no' => $this->productUtil->generateReferenceNumber('stock_adjustment', $ref_count),
+                ];
+
+                //Create stock adjustment transaction
+                $stock_adjustment = Transaction::create($stock_adjstmt_data);
+
+                $stock_adjustment_line = [
+                    'product_id' => $purchase_line->product_id,
+                    'variation_id' => $purchase_line->variation_id,
+                    'quantity' => $qty_unsold,
+                    'unit_price' => $purchase_line->purchase_price_inc_tax,
+                    'removed_purchase_line' => $purchase_line->id,
+                ];
+
+                //Create stock adjustment line with the purchase line
+                $stock_adjustment->stock_adjustment_lines()->create($stock_adjustment_line);
+
+                //Decrease available quantity
+                $this->productUtil->decreaseProductQuantity(
+                    $purchase_line->product_id,
+                    $purchase_line->variation_id,
+                    $purchase_line->transaction->location_id,
+                    $qty_unsold
+                );
+
+                //Map Stock adjustment & Purchase.
+                $business = ['id' => $business_id,
+                    'accounting_method' => request()->session()->get('business.accounting_method'),
+                    'location_id' => $purchase_line->transaction->location_id,
+                ];
+                $this->transactionUtil->mapPurchaseSell($business, $stock_adjustment->stock_adjustment_lines, 'stock_adjustment', false, $purchase_line->id);
+
+                DB::commit();
+
+                $output = ['success' => 1,
+                    'msg' => __('lang_v1.stock_removed_successfully'),
+                ];
+            }
+        } catch (\Exception $e) {
+            DB::rollBack();
+            \Log::emergency('File:'.$e->getFile().'Line:'.$e->getLine().'Message:'.$e->getMessage());
+            $msg = trans('messages.something_went_wrong');
+
+            if (get_class($e) == \App\Exceptions\PurchaseSellMismatch::class) {
+                $msg = $e->getMessage();
+            }
+
+            $output = ['success' => 0,
+                'msg' => $msg,
+            ];
+        }
+
+        return $output;
+    }
+}

@@ -1,0 +1,15 @@
+{
+    "name": "NotificationCenter",
+    "alias": "notificationcenter",
+    "description": "Centralized notification system — Telegram, PDF, multi-location routing, queue processing, and audit logs.",
+    "keywords": [],
+    "active": 1,
+    "order": 0,
+    "providers": [
+        "Modules\\NotificationCenter\\Providers\\NotificationCenterServiceProvider",
+        "Modules\\NotificationCenter\\Providers\\RouteServiceProvider"
+    ],
+    "aliases": {},
+    "files": [],
+    "requires": []
+}

@@ -1,0 +1,14 @@
+<IfModule mod_rewrite.c>
+    <IfModule mod_negotiation.c>
+        Options -Indexes
+    </IfModule>
+
+    RewriteEngine On
+
+    # Never serve the application internals directly from the project root.
+    RewriteRule ^(\.env|\.git|composer\.(json|lock)|package(-lock)?\.json|artisan|phpunit\.xml|modules_statuses\.json|server\.php|.*\.(md|sql|log|ini|sh|bat|ps1))$ - [NC,F]
+
+    # Everything else is served from the public directory.
+    RewriteRule ^public/ - [L]
+    RewriteRule ^(.*)$ public/$1 [L]
+</IfModule>

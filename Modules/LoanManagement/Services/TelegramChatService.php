@@ -1,0 +1,985 @@
+<?php
+
+namespace Modules\LoanManagement\Services;
+
+use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\URL;
+use Illuminate\Support\Facades\Route;
+use App\Services\TelegramBotService;
+use Modules\LoanManagement\Entities\LoanCustomer;
+use Modules\LoanManagement\Entities\LoanFile;
+use Modules\LoanManagement\Entities\LoanTelegramChatMessage;
+use Modules\LoanManagement\Entities\LoanTelegramChatThread;
+use Modules\LoanManagement\Jobs\RelayChatMessageToTelegramJob;
+
+/**
+ * Storage + send/receive logic for the Telegram customer-chat bridge. Fully independent from
+ * LoanChatService/loan_chat_threads (the staff's own internal Live Chat tool) - nothing here
+ * ever reads from or writes to those tables.
+ */
+class TelegramChatService
+{
+    protected array $locationNameCache = [];
+
+    public function findOrCreateThread(int $customerId): LoanTelegramChatThread
+    {
+        $existing = LoanTelegramChatThread::query()
+            ->where('customer_id', $customerId)
+            ->where('status', 'open')
+            ->orderByDesc('last_message_at')
+            ->orderByDesc('id')
+            ->first();
+
+        if ($existing) {
+            return $existing;
+        }
+
+        return LoanTelegramChatThread::query()->create([
+            'customer_id' => $customerId,
+            'status' => 'open',
+            'unread_staff_count' => 0,
+            'unread_customer_count' => 0,
+        ]);
+    }
+
+    public function sendTextMessage(LoanTelegramChatThread $thread, string $senderType, int $senderId, string $message): LoanTelegramChatMessage
+    {
+        return $this->persistMessage($thread, $senderType, $senderId, [
+            'message_type' => 'text',
+            'message' => $message,
+        ]);
+    }
+
+    public function sendImageMessage(LoanTelegramChatThread $thread, string $senderType, int $senderId, UploadedFile $file, ?string $caption = null): LoanTelegramChatMessage
+    {
+        return $this->sendFileMessage($thread, $senderType, $senderId, $file, 'image', $caption);
+    }
+
+    public function sendFileMessage(LoanTelegramChatThread $thread, string $senderType, int $senderId, UploadedFile $file, string $messageType, ?string $caption = null): LoanTelegramChatMessage
+    {
+        $loanFile = app(LoanChatUploadService::class)->storeChatFile($file, 'telegram_'.$messageType, $senderId);
+        $url = app(LoanChatUploadService::class)->url($loanFile);
+
+        return $this->persistMessage($thread, $senderType, $senderId, [
+            'message_type' => $messageType,
+            'message' => $caption,
+            'file_id' => $loanFile->id,
+            'file_url' => $url,
+            'file_name' => $loanFile->original_name ?? null,
+            'file_mime' => $loanFile->mime_type ?? null,
+            'file_size' => (int) ($loanFile->size_bytes ?? $loanFile->size ?? 0) ?: null,
+        ]);
+    }
+
+    public function sendAudioMessage(LoanTelegramChatThread $thread, string $senderType, int $senderId, UploadedFile $file, ?int $durationSeconds = null, ?string $caption = null): LoanTelegramChatMessage
+    {
+        $loanFile = app(LoanChatUploadService::class)->storeChatFile($file, 'telegram_audio', $senderId);
+        $url = app(LoanChatUploadService::class)->url($loanFile);
+
+        return $this->persistMessage($thread, $senderType, $senderId, [
+            'message_type' => 'audio',
+            'message' => $caption,
+            'file_id' => $loanFile->id,
+            'file_url' => $url,
+            'file_name' => $loanFile->original_name ?? null,
+            'file_mime' => $loanFile->mime_type ?? null,
+            'file_size' => (int) ($loanFile->size_bytes ?? $loanFile->size ?? 0) ?: null,
+            'audio_duration_seconds' => $durationSeconds,
+        ]);
+    }
+
+    public function sendLocationMessage(LoanTelegramChatThread $thread, string $senderType, int $senderId, float $latitude, float $longitude, ?string $address = null): LoanTelegramChatMessage
+    {
+        return $this->persistMessage($thread, $senderType, $senderId, [
+            'message_type' => 'location',
+            'latitude' => $latitude,
+            'longitude' => $longitude,
+            'location_address' => $address,
+        ]);
+    }
+
+    public function markRead(LoanTelegramChatThread $thread, string $viewerType): void
+    {
+        if ($viewerType === 'customer' && (int) ($thread->unread_customer_count ?? 0) <= 0) {
+            return;
+        }
+        if ($viewerType !== 'customer' && (int) ($thread->unread_staff_count ?? 0) <= 0) {
+            return;
+        }
+
+        $now = now();
+        $query = LoanTelegramChatMessage::query()->where('thread_id', $thread->id)->where('is_read', false);
+
+        if ($viewerType === 'customer') {
+            $query->where('sender_type', '!=', 'customer');
+        } else {
+            $query->where('sender_type', 'customer');
+        }
+        $query->update(['is_read' => true, 'read_at' => $now, 'updated_at' => $now]);
+
+        if ($viewerType === 'customer') {
+            $thread->unread_customer_count = 0;
+        } else {
+            $thread->unread_staff_count = 0;
+        }
+        $thread->save();
+    }
+
+    public function markUnread(LoanTelegramChatThread $thread, string $viewerType): bool
+    {
+        $viewerIsCustomer = $viewerType === 'customer';
+        $message = LoanTelegramChatMessage::query()
+            ->where('thread_id', $thread->id)
+            ->when($viewerIsCustomer, function ($query) {
+                $query->where('sender_type', '!=', 'customer');
+            }, function ($query) {
+                $query->where('sender_type', 'customer');
+            })
+            ->orderByDesc('id')
+            ->first();
+
+        if (! $message) {
+            return false;
+        }
+
+        $message->is_read = false;
+        $message->read_at = null;
+        $message->save();
+
+        if ($viewerIsCustomer) {
+            $thread->unread_customer_count = max(1, (int) ($thread->unread_customer_count ?? 0));
+        } else {
+            $thread->unread_staff_count = max(1, (int) ($thread->unread_staff_count ?? 0));
+        }
+        $thread->save();
+
+        return true;
+    }
+
+    /**
+     * Contacts for the staff sidebar: existing threads (with last message/unread info) plus
+     * customer-only rows for customers who don't have a thread yet. Optionally scoped to a
+     * set of permitted loan_business_locations ids (null = unrestricted).
+     */
+    public function listContactsForStaff(string $search = '', ?array $locationIds = null, array $filters = []): Collection
+    {
+        $filterLocationId = (int) ($filters['location_id'] ?? 0);
+        if ($filterLocationId > 0) {
+            if ($locationIds !== null && ! in_array($filterLocationId, $locationIds, true)) {
+                return collect();
+            }
+            $locationIds = [$filterLocationId];
+        }
+        $telegramStatus = (string) ($filters['telegram_status'] ?? '');
+        $includeCustomers = (bool) ($filters['include_customers'] ?? true);
+
+        $threads = LoanTelegramChatThread::query()
+            ->where('status', 'open')
+            ->with('customer')
+            ->orderByDesc('last_message_at')
+            ->orderByDesc('id')
+            ->limit(200)
+            ->get();
+
+        $existingCustomerIds = [];
+        $rows = collect();
+
+        foreach ($threads as $thread) {
+            $customer = $thread->customer;
+            if (! $customer) {
+                continue;
+            }
+            if ($locationIds !== null && ! $this->customerWithinLocations($customer, $locationIds)) {
+                continue;
+            }
+            if ($search !== '' && ! $this->customerMatchesSearch($customer, $search)) {
+                continue;
+            }
+
+            $existingCustomerIds[(int) $customer->id] = true;
+            $profile = $this->customerProfile($customer);
+            if (! $this->passesTelegramStatus($profile['telegram_linked'], $telegramStatus)) {
+                continue;
+            }
+            $rows->push([
+                'id' => (int) $thread->id,
+                'customer_id' => (int) $customer->id,
+                'display_name' => $profile['display_name'],
+                'customer_name' => $profile['display_name'],
+                'customer_phone' => $profile['phone'],
+                'display_subtitle' => $profile['subtitle'],
+                'location_id' => $profile['location_id'],
+                'location_name' => $profile['location_name'],
+                'avatar_url' => $profile['avatar_url'],
+                'loan_id' => $profile['loan_id'],
+                'loan_number' => $profile['loan_number'],
+                'invoice_no' => $profile['invoice_no'],
+                'installment_no' => $profile['installment_no'],
+                'installment_total' => $profile['installment_total'],
+                'balance_amount' => $profile['balance_amount'],
+                'last_message' => (string) ($thread->last_message ?? ''),
+                'last_message_type' => (string) ($thread->last_message_type ?? 'text'),
+                'last_message_at' => $thread->last_message_at?->format('Y-m-d H:i:s'),
+                'unread_count' => (int) ($thread->unread_staff_count ?? 0),
+                'telegram_linked' => $profile['telegram_linked'],
+                'is_customer_only' => false,
+            ]);
+        }
+
+        if (! $includeCustomers || ! Schema::connection('mysql_loan')->hasTable('loan_customers')) {
+            return $rows;
+        }
+
+        $query = DB::connection('mysql_loan')->table('loan_customers');
+        if (Schema::connection('mysql_loan')->hasColumn('loan_customers', 'deleted_at')) {
+            $query->whereNull('deleted_at');
+        }
+        if ($locationIds !== null && Schema::connection('mysql_loan')->hasColumn('loan_customers', 'business_location_id')) {
+            $query->where(function ($inner) use ($locationIds) {
+                $inner->whereNull('business_location_id')->orWhereIn('business_location_id', $locationIds);
+            });
+        }
+        if ($search !== '') {
+            $query->where(function ($inner) use ($search) {
+                foreach (['name', 'khmer_name', 'phone', 'login_phone', 'customer_code'] as $column) {
+                    if (Schema::connection('mysql_loan')->hasColumn('loan_customers', $column)) {
+                        $inner->orWhere($column, 'like', '%'.$search.'%');
+                    }
+                }
+            });
+
+            if (Schema::connection('mysql_loan')->hasTable('loans')
+                && Schema::connection('mysql_loan')->hasColumn('loans', 'customer_id')) {
+                $query->orWhereExists(function ($q) use ($search) {
+                    $q->select(DB::raw(1))
+                        ->from('loans')
+                        ->whereColumn('loans.customer_id', 'loan_customers.id');
+                    if (Schema::connection('mysql_loan')->hasColumn('loans', 'deleted_at')) {
+                        $q->whereNull('loans.deleted_at');
+                    }
+                    $q->where(function ($inner) use ($search) {
+                        foreach (['source_invoice_no', 'loan_number', 'invoice_number_snapshot'] as $column) {
+                            if (Schema::connection('mysql_loan')->hasColumn('loans', $column)) {
+                                $inner->orWhere('loans.'.$column, 'like', '%'.$search.'%');
+                            }
+                        }
+                    });
+                });
+            }
+        }
+
+        $customers = $query->orderByDesc('id')->limit(300)->get();
+        foreach ($customers as $customer) {
+            if (isset($existingCustomerIds[(int) $customer->id])) {
+                continue;
+            }
+
+            $profile = $this->customerProfile($customer);
+            if (! $this->passesTelegramStatus($profile['telegram_linked'], $telegramStatus)) {
+                continue;
+            }
+            $rows->push([
+                'id' => null,
+                'customer_id' => (int) $customer->id,
+                'display_name' => $profile['display_name'],
+                'customer_name' => $profile['display_name'],
+                'customer_phone' => $profile['phone'],
+                'display_subtitle' => $profile['subtitle'],
+                'location_id' => $profile['location_id'],
+                'location_name' => $profile['location_name'],
+                'avatar_url' => $profile['avatar_url'],
+                'loan_id' => $profile['loan_id'],
+                'loan_number' => $profile['loan_number'],
+                'invoice_no' => $profile['invoice_no'],
+                'installment_no' => $profile['installment_no'],
+                'installment_total' => $profile['installment_total'],
+                'balance_amount' => $profile['balance_amount'],
+                'last_message' => '',
+                'last_message_type' => 'text',
+                'last_message_at' => null,
+                'unread_count' => 0,
+                'telegram_linked' => $profile['telegram_linked'],
+                'is_customer_only' => true,
+            ]);
+        }
+
+        return $rows;
+    }
+
+    public function staffContactSnapshot(?array $locationIds = null, array $filters = []): array
+    {
+        $filterLocationId = (int) ($filters['location_id'] ?? 0);
+        if ($filterLocationId > 0) {
+            if ($locationIds !== null && ! in_array($filterLocationId, $locationIds, true)) {
+                return [
+                    'version' => 'empty',
+                    'thread_count' => 0,
+                    'unread_count' => 0,
+                ];
+            }
+            $locationIds = [$filterLocationId];
+        }
+
+        $query = LoanTelegramChatThread::query()
+            ->where('status', 'open');
+
+        if ($locationIds !== null
+            && Schema::connection('mysql_loan')->hasTable('loan_customers')
+            && Schema::connection('mysql_loan')->hasColumn('loan_customers', 'business_location_id')) {
+            $query->whereExists(function ($inner) use ($locationIds) {
+                $inner->select(DB::raw(1))
+                    ->from('loan_customers')
+                    ->whereColumn('loan_customers.id', 'loan_telegram_chat_threads.customer_id')
+                    ->where(function ($locationQuery) use ($locationIds) {
+                        $locationQuery->whereNull('loan_customers.business_location_id')
+                            ->orWhereIn('loan_customers.business_location_id', $locationIds);
+                    });
+            });
+        }
+
+        $stats = (clone $query)
+            ->selectRaw('COUNT(*) as thread_count, COALESCE(SUM(unread_staff_count), 0) as unread_count, UNIX_TIMESTAMP(MAX(updated_at)) as updated_version, UNIX_TIMESTAMP(MAX(last_message_at)) as message_version')
+            ->first();
+
+        $threadCount = (int) ($stats->thread_count ?? 0);
+        $unreadCount = (int) ($stats->unread_count ?? 0);
+        $updatedVersion = (int) ($stats->updated_version ?? 0);
+        $messageVersion = (int) ($stats->message_version ?? 0);
+
+        return [
+            'version' => implode(':', [$threadCount, $unreadCount, max($updatedVersion, $messageVersion)]),
+            'thread_count' => $threadCount,
+            'unread_count' => $unreadCount,
+        ];
+    }
+
+    public function formatThread(
+        LoanTelegramChatThread $thread,
+        ?string $viewerType = null,
+        ?int $viewerId = null,
+        array $messageOptions = []
+    ): array
+    {
+        $thread->loadMissing(['customer']);
+        $customer = $thread->customer;
+        $profile = $this->customerProfile($customer);
+        $messagePage = $this->threadMessagePage($thread, $messageOptions);
+        $messages = $messagePage['messages'];
+        $isCustomerViewer = $viewerType === 'customer';
+        $avatarUrl = $profile['avatar_url'];
+
+        return [
+            'id' => (int) $thread->id,
+            'customer_id' => (int) $thread->customer_id,
+            'display_name' => $profile['display_name'],
+            'customer_name' => $profile['display_name'],
+            'customer_phone' => $profile['phone'],
+            'location_id' => $profile['location_id'],
+            'location_name' => $profile['location_name'],
+            'telegram_linked' => $profile['telegram_linked'],
+            'avatar_url' => $avatarUrl,
+            'customer_photo_url' => $avatarUrl,
+            'loan_id' => $profile['loan_id'],
+            'loan_number' => $profile['loan_number'],
+            'invoice_no' => $profile['invoice_no'],
+            'installment_no' => $profile['installment_no'],
+            'installment_total' => $profile['installment_total'],
+            'balance_amount' => $profile['balance_amount'],
+            'customer_profile' => $profile,
+            'status' => (string) $thread->status,
+            'display_name' => $profile['display_name'],
+            'display_subtitle' => $profile['subtitle'],
+            'last_message' => (string) ($thread->last_message ?? ''),
+            'last_message_type' => (string) ($thread->last_message_type ?? ''),
+            'last_message_at' => $thread->last_message_at?->toIso8601String(),
+            'unread_count' => $isCustomerViewer
+                ? (int) ($thread->unread_customer_count ?? 0)
+                : (int) ($thread->unread_staff_count ?? 0),
+            'message_count' => $messagePage['total'],
+            'can_delete' => $messagePage['total'] !== null ? $messagePage['total'] === 0 : false,
+            'message_pagination' => [
+                'limit' => $messagePage['limit'],
+                'has_more_older' => $messagePage['has_more_older'],
+                'oldest_message_id' => $messages->first()?->id ? (int) $messages->first()->id : null,
+                'newest_message_id' => $messages->last()?->id ? (int) $messages->last()->id : null,
+            ],
+            'messages' => $messages
+                ->map(fn ($m) => $this->formatMessage($m, $viewerType, $viewerId))
+                ->values()
+                ->all(),
+        ];
+    }
+
+    protected function threadMessagePage(LoanTelegramChatThread $thread, array $options = []): array
+    {
+        if (($options['include_messages'] ?? true) === false) {
+            return [
+                'messages' => collect(),
+                'limit' => 0,
+                'has_more_older' => false,
+                'total' => (int) $thread->messages()->count(),
+            ];
+        }
+
+        if (empty($options)) {
+            $messages = $thread->messages()->orderBy('created_at')->orderBy('id')->get()->values();
+
+            return [
+                'messages' => $messages,
+                'limit' => $messages->count(),
+                'has_more_older' => false,
+                'total' => $messages->count(),
+            ];
+        }
+
+        $limit = max(1, min(100, (int) ($options['limit'] ?? 25)));
+        $beforeId = max(0, (int) ($options['before_id'] ?? 0));
+        $afterId = max(0, (int) ($options['after_id'] ?? 0));
+        $countTotal = (bool) ($options['count_total'] ?? true);
+        $query = $thread->messages();
+
+        if ($beforeId > 0) {
+            $rows = $query->where('id', '<', $beforeId)
+                ->orderByDesc('id')
+                ->limit($limit + 1)
+                ->get();
+            $hasMoreOlder = $rows->count() > $limit;
+            $messages = $rows->take($limit)->sortBy('id')->values();
+        } elseif ($afterId > 0) {
+            $messages = $query->where('id', '>', $afterId)
+                ->orderBy('id')
+                ->limit($limit)
+                ->get()
+                ->values();
+            $hasMoreOlder = false;
+        } else {
+            $rows = $query->orderByDesc('id')
+                ->limit($limit + 1)
+                ->get();
+            $hasMoreOlder = $rows->count() > $limit;
+            $messages = $rows->take($limit)->sortBy('id')->values();
+        }
+
+        return [
+            'messages' => $messages,
+            'limit' => $limit,
+            'has_more_older' => $hasMoreOlder,
+            'total' => $countTotal ? (int) $thread->messages()->count() : null,
+        ];
+    }
+
+    public function formatMessage(
+        LoanTelegramChatMessage $message,
+        ?string $viewerType = null,
+        ?int $viewerId = null
+    ): array
+    {
+        $file = null;
+        $loanFile = null;
+        $resolvedUrl = '';
+        if (! empty($message->file_id)) {
+            $loanFile = LoanFile::query()->find($message->file_id);
+            $resolvedUrl = $viewerType === 'customer'
+                ? ($this->publicLoanFileUrl($loanFile) ?: url('api/loan-management/customer/telegram/chat-files/'.(int) $message->file_id))
+                : url('loan-management/chat-files/'.(int) $message->file_id);
+        } elseif (! empty($message->file_url)) {
+            $resolvedUrl = $this->absoluteUrl((string) $message->file_url);
+        }
+
+        if ($resolvedUrl !== '' || ! empty($message->file_id)) {
+            $file = [
+                'id' => (int) ($message->file_id ?? 0),
+                'file_id' => (int) ($message->file_id ?? 0),
+                'url' => $resolvedUrl,
+                'preview_url' => $resolvedUrl,
+                'name' => (string) ($message->file_name ?? ''),
+                'mime_type' => (string) ($message->file_mime ?? $loanFile?->mime_type ?? ''),
+                'size_bytes' => (int) ($message->file_size ?? $loanFile?->size_bytes ?? $loanFile?->size ?? 0),
+            ];
+        }
+        $meta = is_array($message->metadata) ? $message->metadata : (json_decode((string) $message->metadata, true) ?: []);
+        $user = auth()->user();
+        $isOutbound = in_array($message->sender_type, ['staff', 'admin'], true);
+        $isOwn = $viewerType === 'customer'
+            ? $message->sender_type === 'customer' && (int) $message->sender_id === (int) $viewerId
+            : $isOutbound;
+        $canManageTelegramChat = $user && (
+            $user->can('loan_management.chat.view')
+            || $user->can('loan_management.chat.reply')
+            || $user->can('loan_management.chat.delete')
+            || $user->can('loan_management.chat.admin')
+        );
+
+        return [
+            'id' => (int) $message->id,
+            'thread_id' => (int) $message->thread_id,
+            'sender_type' => (string) $message->sender_type,
+            'sender_id' => (int) $message->sender_id,
+            'sender_name' => (string) ($message->sender_name_snapshot ?? ''),
+            'message' => (string) ($message->message ?? ''),
+            'message_type' => (string) $message->message_type,
+            'file' => $file ?? (object) [],
+            'file_url' => $resolvedUrl,
+            'quote_text' => (string) ($meta['quote_text'] ?? $meta['reply_to_text'] ?? ''),
+            'quote_author' => (string) ($meta['quote_author'] ?? $meta['reply_to_author'] ?? ''),
+            'reaction' => (string) ($meta['reaction'] ?? ''),
+            'latitude' => $message->latitude,
+            'longitude' => $message->longitude,
+            'audio_duration_seconds' => $message->audio_duration_seconds,
+            'is_own' => $isOwn,
+            'read_at' => $message->read_at?->toIso8601String(),
+            'created_at' => $message->created_at?->format('Y-m-d H:i:s'),
+            'updated_at' => $message->updated_at?->format('Y-m-d H:i:s'),
+            'edited' => $message->updated_at && $message->created_at && $message->updated_at->gt($message->created_at->copy()->addSeconds(2)),
+            'can_update' => $viewerType !== 'customer'
+                && $message->message_type === 'text'
+                && $isOutbound
+                && $canManageTelegramChat,
+            'can_delete' => $viewerType !== 'customer' && $isOutbound && $canManageTelegramChat,
+        ];
+    }
+
+    public function updateTextMessage(LoanTelegramChatMessage $message, string $text): LoanTelegramChatMessage
+    {
+        $telegramSynced = $this->editTelegramMessageIfNeeded($message, $text);
+        $metadata = array_merge((array) ($message->metadata ?? []), [
+            'edited_at' => now()->toIso8601String(),
+            'edited_by' => auth()->id(),
+        ]);
+        if ($telegramSynced) {
+            $metadata['telegram_edited_at'] = now()->toIso8601String();
+        } else {
+            $metadata['telegram_edit_skipped_at'] = now()->toIso8601String();
+            $metadata['telegram_edit_skipped_reason'] = 'telegram_message_id_missing';
+        }
+
+        $message->message = $text;
+        $message->metadata = $metadata;
+        $message->save();
+
+        $this->refreshThreadLastMessage($message->thread);
+
+        return $message->refresh();
+    }
+
+    public function deleteMessage(LoanTelegramChatMessage $message): void
+    {
+        $thread = $message->thread;
+        $this->deleteTelegramMessageIfNeeded($message);
+        $message->delete();
+
+        if ($thread) {
+            $this->refreshThreadLastMessage($thread);
+        }
+    }
+
+    protected function editTelegramMessageIfNeeded(LoanTelegramChatMessage $message, string $text): bool
+    {
+        $this->assertOutboundTelegramMessage($message, 'edited');
+
+        $ids = $this->telegramMessageIdentifiers($message);
+        if (! $ids) {
+            return false;
+        }
+
+        (new TelegramBotService(TelegramSettingsService::botToken()))
+            ->editMessageText($ids['chat_id'], $ids['message_id'], $text);
+
+        return true;
+    }
+
+    protected function deleteTelegramMessageIfNeeded(LoanTelegramChatMessage $message): bool
+    {
+        $this->assertOutboundTelegramMessage($message, 'deleted');
+
+        $ids = $this->telegramMessageIdentifiers($message);
+        if (! $ids) {
+            return false;
+        }
+
+        (new TelegramBotService(TelegramSettingsService::botToken()))
+            ->deleteMessage($ids['chat_id'], $ids['message_id']);
+
+        return true;
+    }
+
+    protected function telegramMessageIdentifiers(LoanTelegramChatMessage $message): ?array
+    {
+        $metadata = (array) ($message->metadata ?? []);
+        $chatId = trim((string) ($metadata['telegram_chat_id'] ?? ''));
+        $messageId = (int) ($metadata['telegram_message_id'] ?? 0);
+
+        if ($chatId === '' && $message->thread) {
+            $customer = LoanCustomer::query()->find($message->thread->customer_id);
+            $chatId = trim((string) ($customer->telegram_chat_id ?? ''));
+        }
+
+        if ($chatId === '' || $messageId <= 0) {
+            return null;
+        }
+
+        return [
+            'chat_id' => $chatId,
+            'message_id' => $messageId,
+        ];
+    }
+
+    protected function assertOutboundTelegramMessage(LoanTelegramChatMessage $message, string $action): void
+    {
+        if (! in_array($message->sender_type, ['staff', 'admin'], true)) {
+            throw new \RuntimeException('Only system/staff messages can be '.$action.' in Telegram.');
+        }
+    }
+
+    protected function persistMessage(LoanTelegramChatThread $thread, string $senderType, int $senderId, array $data): LoanTelegramChatMessage
+    {
+        $message = DB::connection('mysql_loan')->transaction(function () use ($thread, $senderType, $senderId, $data) {
+            $msg = LoanTelegramChatMessage::query()->create(array_merge([
+                'thread_id' => $thread->id,
+                'sender_type' => $senderType,
+                'sender_id' => $senderId,
+                'sender_name_snapshot' => $data['sender_name_snapshot'] ?? $this->resolveSenderName($senderType, $senderId),
+            ], $data));
+
+            $thread->last_message = $this->lastMessageSnapshot($msg);
+            $thread->last_message_type = $msg->message_type;
+            $thread->last_message_at = $msg->created_at ?? now();
+            if ($senderType === 'customer') {
+                $thread->unread_staff_count = (int) ($thread->unread_staff_count ?? 0) + 1;
+            } else {
+                $thread->unread_customer_count = (int) ($thread->unread_customer_count ?? 0) + 1;
+            }
+            $thread->save();
+
+            return $msg;
+        });
+
+        $this->relayToTelegramIfOutbound($message, $thread);
+
+        return $message;
+    }
+
+    protected function relayToTelegramIfOutbound(LoanTelegramChatMessage $message, LoanTelegramChatThread $thread): void
+    {
+        if (! in_array($message->sender_type, ['staff', 'admin'], true)) {
+            // Inbound (from Telegram) messages never get relayed back out - no echo loop.
+            return;
+        }
+
+        $customer = LoanCustomer::query()->find($thread->customer_id);
+        if (! $customer || empty($customer->telegram_chat_id)) {
+            return;
+        }
+
+        try {
+            if (method_exists(RelayChatMessageToTelegramJob::class, 'dispatchAfterResponse')) {
+                RelayChatMessageToTelegramJob::dispatchAfterResponse((int) $message->id, (string) $customer->telegram_chat_id);
+            } else {
+                RelayChatMessageToTelegramJob::dispatch((int) $message->id, (string) $customer->telegram_chat_id);
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Failed to dispatch Telegram chat relay job', ['error' => $e->getMessage()]);
+        }
+    }
+
+    protected function resolveSenderName(string $senderType, int $senderId): string
+    {
+        if ($senderType === 'customer') {
+            $customer = LoanCustomer::query()->find($senderId);
+            return (string) ($customer->khmer_name ?? $customer->name ?? 'Customer');
+        }
+
+        if (class_exists(\App\User::class)) {
+            $user = \App\User::query()->find($senderId);
+            if ($user) {
+                $name = trim((string) (($user->first_name ?? '').' '.($user->last_name ?? '')));
+                return $name ?: (string) ($user->username ?? $user->name ?? 'Staff');
+            }
+        }
+
+        return $senderType === 'admin' ? 'Admin' : 'Staff';
+    }
+
+    protected function lastMessageSnapshot(LoanTelegramChatMessage $message): string
+    {
+        return match ($message->message_type) {
+            'text' => (string) ($message->message ?? ''),
+            'location' => 'Location shared',
+            'image' => $message->file_name ? 'Image: '.$message->file_name : 'Image',
+            'file' => $message->file_name ? 'File: '.$message->file_name : 'File',
+            'audio' => 'Voice message',
+            default => (string) ($message->message ?? strtoupper($message->message_type)),
+        };
+    }
+
+    protected function refreshThreadLastMessage(?LoanTelegramChatThread $thread): void
+    {
+        if (! $thread) {
+            return;
+        }
+
+        $last = LoanTelegramChatMessage::query()
+            ->where('thread_id', $thread->id)
+            ->orderByDesc('created_at')
+            ->orderByDesc('id')
+            ->first();
+
+        if ($last) {
+            $thread->last_message = $this->lastMessageSnapshot($last);
+            $thread->last_message_type = $last->message_type;
+            $thread->last_message_at = $last->created_at ?? now();
+        } else {
+            $thread->last_message = null;
+            $thread->last_message_type = null;
+            $thread->last_message_at = null;
+        }
+
+        $thread->save();
+    }
+
+    protected function customerWithinLocations(LoanCustomer $customer, array $locationIds): bool
+    {
+        $locationId = $customer->business_location_id ?? null;
+        return $locationId === null || in_array((int) $locationId, $locationIds, true);
+    }
+
+    protected function customerMatchesSearch(LoanCustomer $customer, string $search): bool
+    {
+        $needle = mb_strtolower($search);
+        $locationName = $this->customerLocationName($customer);
+        foreach ([$customer->name, $customer->khmer_name, $customer->phone, $customer->login_phone, $customer->customer_code, $locationName] as $field) {
+            if ($field && str_contains(mb_strtolower((string) $field), $needle)) {
+                return true;
+            }
+        }
+
+        return $this->customerHasLoanInvoiceMatching($customer, $needle);
+    }
+
+    protected function customerHasLoanInvoiceMatching(LoanCustomer $customer, string $needle): bool
+    {
+        $customerId = (int) ($customer->id ?? 0);
+        if ($customerId <= 0
+            || ! Schema::connection('mysql_loan')->hasTable('loans')
+            || ! Schema::connection('mysql_loan')->hasColumn('loans', 'customer_id')) {
+            return false;
+        }
+
+        $query = DB::connection('mysql_loan')->table('loans')->where('customer_id', $customerId);
+        if (Schema::connection('mysql_loan')->hasColumn('loans', 'deleted_at')) {
+            $query->whereNull('deleted_at');
+        }
+        $query->where(function ($inner) use ($needle) {
+            foreach (['source_invoice_no', 'loan_number', 'invoice_number_snapshot'] as $column) {
+                if (Schema::connection('mysql_loan')->hasColumn('loans', $column)) {
+                    $inner->orWhere($column, 'like', '%'.$needle.'%');
+                }
+            }
+        });
+
+        return $query->exists();
+    }
+
+    protected function customerProfile($customer): array
+    {
+        $name = trim((string) ($customer->khmer_name ?? '')) ?: trim((string) ($customer->name ?? '')) ?: 'Customer';
+        $phone = trim((string) ($customer->phone ?? '')) ?: trim((string) ($customer->login_phone ?? ''));
+        $code = trim((string) ($customer->customer_code ?? ''));
+        $locationName = $this->customerLocationName($customer);
+        $subtitle = collect([$phone, $code, $locationName])->filter()->implode(' · ');
+        $loan = $this->currentLoanForCustomer((int) ($customer->id ?? 0));
+
+        $invoice = '';
+        $installmentNo = null;
+        $installmentTotal = null;
+        if ($loan) {
+            $invoice = trim((string) ($loan->source_invoice_no ?? ''))
+                ?: trim((string) ($loan->invoice_number_snapshot ?? ''))
+                ?: trim((string) ($loan->loan_number ?? ''))
+                ?: (string) $loan->id;
+            $installmentInfo = $this->loanInstallmentInfo((int) $loan->id);
+            $installmentNo = $installmentInfo['installment_no'];
+            $installmentTotal = $installmentInfo['installment_total'];
+        }
+
+        return [
+            'id' => (int) ($customer->id ?? 0),
+            'display_name' => $name,
+            'phone' => $phone,
+            'customer_code' => $code,
+            'subtitle' => $subtitle,
+            'location_id' => $customer->business_location_id === null ? null : (int) $customer->business_location_id,
+            'location_name' => $locationName,
+            'telegram_username' => trim((string) ($customer->telegram_username ?? '')),
+            'telegram_linked' => ! empty($customer->telegram_chat_id),
+            'avatar_url' => $this->customerAvatarUrl($customer),
+            'loan_id' => $loan ? (int) $loan->id : null,
+            'loan_number' => $loan ? (string) ($loan->loan_number ?? $loan->id) : '',
+            'invoice_no' => $invoice,
+            'installment_no' => $installmentNo,
+            'installment_total' => $installmentTotal,
+            'balance_amount' => $loan ? (string) ($loan->balance_amount ?? '') : '',
+        ];
+    }
+
+    protected function currentLoanForCustomer(int $customerId)
+    {
+        if ($customerId <= 0
+            || ! Schema::connection('mysql_loan')->hasTable('loans')
+            || ! Schema::connection('mysql_loan')->hasColumn('loans', 'customer_id')) {
+            return null;
+        }
+
+        $query = DB::connection('mysql_loan')->table('loans')->where('customer_id', $customerId);
+        if (Schema::connection('mysql_loan')->hasColumn('loans', 'deleted_at')) {
+            $query->whereNull('deleted_at');
+        }
+        if (Schema::connection('mysql_loan')->hasColumn('loans', 'status')) {
+            $query->orderByRaw("CASE WHEN LOWER(COALESCE(status, '')) IN ('active', 'overdue', 'late', 'partial') THEN 0 ELSE 1 END");
+        }
+
+        $columns = ['id'];
+        foreach (['loan_number', 'balance_amount', 'source_invoice_no', 'invoice_number_snapshot'] as $column) {
+            if (Schema::connection('mysql_loan')->hasColumn('loans', $column)) {
+                $columns[] = $column;
+            }
+        }
+
+        return $query->orderByDesc('id')->first($columns);
+    }
+
+    protected function loanInstallmentInfo(int $loanId): array
+    {
+        if ($loanId <= 0
+            || ! Schema::connection('mysql_loan')->hasTable('loan_payment_schedules')
+            || ! Schema::connection('mysql_loan')->hasColumn('loan_payment_schedules', 'loan_id')) {
+            return ['installment_no' => null, 'installment_total' => null];
+        }
+
+        $schedules = DB::connection('mysql_loan')->table('loan_payment_schedules')
+            ->where('loan_id', $loanId)
+            ->when(Schema::connection('mysql_loan')->hasColumn('loan_payment_schedules', 'deleted_at'), fn ($query2) => $query2->whereNull('deleted_at'));
+
+        $total = (int) (clone $schedules)->count();
+
+        $next = null;
+        if (Schema::connection('mysql_loan')->hasColumn('loan_payment_schedules', 'balance_amount')) {
+            $next = (clone $schedules)
+                ->where('balance_amount', '>', 0)
+                ->orderBy('installment_no')
+                ->orderBy('id')
+                ->value('installment_no');
+        }
+
+        return [
+            'installment_no' => $next === null ? null : (int) $next,
+            'installment_total' => $total > 0 ? $total : null,
+        ];
+    }
+
+    protected function passesTelegramStatus(bool $linked, string $status): bool
+    {
+        return $status === ''
+            || ($status === 'linked' && $linked)
+            || ($status === 'unlinked' && ! $linked);
+    }
+
+    protected function customerLocationName($customer): string
+    {
+        $snapshot = trim((string) ($customer->business_location_name_snapshot ?? ''));
+        if ($snapshot !== '') {
+            return $snapshot;
+        }
+
+        $locationId = (int) ($customer->business_location_id ?? 0);
+        if ($locationId <= 0) {
+            return '';
+        }
+        if (array_key_exists($locationId, $this->locationNameCache)) {
+            return $this->locationNameCache[$locationId];
+        }
+        if (! Schema::connection('mysql_loan')->hasTable('loan_business_locations')) {
+            return $this->locationNameCache[$locationId] = '';
+        }
+
+        return $this->locationNameCache[$locationId] = (string) DB::connection('mysql_loan')
+            ->table('loan_business_locations')
+            ->where('id', $locationId)
+            ->value('name');
+    }
+
+    protected function customerAvatarUrl($customer): string
+    {
+        if (! $customer) {
+            return '';
+        }
+
+        if (! empty($customer->customer_photo_file_id)) {
+            $file = LoanFile::query()->find($customer->customer_photo_file_id);
+            if ($file) {
+                return $this->publicLoanFileUrl($file) ?: url('loan-management/chat-files/'.(int) $file->id);
+            }
+        }
+
+        if (! empty($customer->photo_url)) {
+            return (string) $customer->photo_url;
+        }
+
+        if (! empty($customer->profile_photo)) {
+            return $this->absoluteUrl(Storage::disk('public')->url($customer->profile_photo));
+        }
+
+        return '';
+    }
+
+    protected function publicLoanFileUrl(?LoanFile $file): string
+    {
+        if (! $file) {
+            return '';
+        }
+
+        if (! empty($file->id) && Route::has('loan-management.public.customer-telegram-file')) {
+            return URL::temporarySignedRoute(
+                'loan-management.public.customer-telegram-file',
+                now()->addDay(),
+                ['file' => (int) $file->id]
+            );
+        }
+
+        if (! empty($file->path)) {
+            return $this->absoluteUrl(Storage::disk($file->disk ?: 'public')->url($file->path));
+        }
+
+        if (! empty($file->url) && ! str_contains((string) $file->url, '/api/')) {
+            return $this->absoluteUrl((string) $file->url);
+        }
+
+        return '';
+    }
+
+    protected function absoluteUrl(string $path): string
+    {
+        $path = trim($path);
+        if ($path === '') {
+            return '';
+        }
+
+        if (preg_match('#^https?://#i', $path)) {
+            $appHost = parse_url((string) config('app.url'), PHP_URL_HOST);
+            $pathHost = parse_url($path, PHP_URL_HOST);
+            $appScheme = parse_url((string) config('app.url'), PHP_URL_SCHEME);
+            if ($appScheme === 'https' && $appHost && $pathHost && strcasecmp($appHost, $pathHost) === 0) {
+                return preg_replace('#^http://#i', 'https://', $path);
+            }
+
+            return $path;
+        }
+
+        return url($path);
+    }
+}

@@ -1,0 +1,112 @@
+# Dependencies
+/vendor/
+/node_modules/
+
+# Laravel environment and local keys
+.env
+.env.*
+!.env.example
+/storage/*.key
+/auth.json
+
+# Laravel runtime storage
+/storage/app/public/*
+!/storage/app/public/.gitignore
+/storage/app/loan-management/prepared-imports/*
+!/storage/app/loan-management/prepared-imports/.gitignore
+/storage/app/notification-temp/*
+!/storage/app/notification-temp/.gitignore
+/storage/app/temp/*
+!/storage/app/temp/.gitignore
+/storage/debugbar/
+/storage/framework/cache/*
+!/storage/framework/cache/.gitignore
+/storage/framework/cache/data/*
+!/storage/framework/cache/data/.gitignore
+/storage/framework/sessions/*
+!/storage/framework/sessions/.gitignore
+/storage/framework/testing/*
+!/storage/framework/testing/.gitignore
+/storage/framework/tmp/*
+!/storage/framework/tmp/.gitignore
+/storage/framework/views/*
+!/storage/framework/views/.gitignore
+/storage/logs/*
+!/storage/logs/.gitignore
+
+# Laravel generated/cache files
+/bootstrap/cache/*
+!/bootstrap/cache/.gitignore
+/.phpunit.result.cache
+/public/hot
+/public/build/
+/public/mix-manifest.json
+/public/storage
+
+# User uploads and generated public files
+/public/uploads/*
+!/public/uploads/.gitignore
+/public/modules/service/v7/uploads/*
+/Modules/*/Public/*/uploads/*
+!/Modules/*/Public/*/uploads/.gitignore
+
+# Module runtime files
+/Modules/*/storage/exports/*
+/Modules/*/storage/imports/*
+/Modules/LoanManagement/storage/*
+
+# Generated documentation
+/.scribe/
+/public/docs/
+
+# Local imports, exports, archives, and backups
+*.bak
+*.backup
+*.backup-before-*
+*.orig
+*.rej
+*.csv
+*.pkg
+*.rar
+*.sql
+*.xls
+*.xlsx
+*.zip
+*.7z
+/storage/backup_*/
+/storage/diag_*.php
+/storage/app/temp/mpdf/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.lnk
+/.fleet/
+/.idea/
+/.vagrant/
+/.vscode/
+Homestead.json
+Homestead.yaml
+
+# AI agent scratch space
+/.codex/
+
+# Debug and test scratch files
+cookies.txt
+login_page.html
+login_result*.html
+products_page.html
+response*.json
+test_query*.php
+tmp_loan_check.php
+.tmp_check_loan_cols.php
+query
+PsySH/
+
+# Package manager logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

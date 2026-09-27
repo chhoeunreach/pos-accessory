@@ -1,0 +1,29 @@
+<IfModule mod_rewrite.c>
+    <IfModule mod_negotiation.c>
+        Options -MultiViews -Indexes
+    </IfModule>
+
+    RewriteEngine On
+
+    # Handle Authorization Header
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+    # Never execute or serve scripts from directories that receive user uploads
+    RewriteRule ^(uploads|storage|modules|files)/.*\.(htaccess|htpasswd|ini|phps|phtml|phar|fla|psd|log|sh|zip|exe|pl|jsp|asp|aspx|htm|html|shtml|cgi|py|php[0-9]?)$ - [NC,F]
+
+    # Lock the installer down once the application is installed.
+    # The .env file lives in the project root, one level above public/.
+    RewriteCond %{DOCUMENT_ROOT}/../.env -f
+    RewriteRule ^install(/|$) - [NC,F]
+
+    # Redirect Trailing Slashes If Not A Folder...
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_URI} (.+)/$
+    RewriteRule ^ %1 [L,R=301]
+
+    # Send Requests To Front Controller...
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteRule ^ index.php [L]
+</IfModule>
