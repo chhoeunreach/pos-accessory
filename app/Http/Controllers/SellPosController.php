@@ -802,7 +802,6 @@ class SellPosController extends Controller
             abort(404);
         }
 
-        $relative_url_path = $relative_path;
         $relative_path = str_replace(['/', '\\'], DIRECTORY_SEPARATOR, $relative_path);
         $candidate_roots = array_filter([
             env('HR_SELL_OUT_PHOTO_PATH'),
@@ -823,13 +822,11 @@ class SellPosController extends Controller
             }
         }
 
-        $hr_app_url = rtrim(env('HR_APP_URL', config('app.url')), '/');
-        $storage_position = !empty($photo->photo_url) ? strpos($photo->photo_url, '/storage/') : false;
-        if ($storage_position !== false) {
-            $hr_app_url = substr($photo->photo_url, 0, $storage_position);
+        if (!empty($photo->photo_url)) {
+            return redirect()->away($photo->photo_url);
         }
 
-        return redirect()->away($hr_app_url . '/storage/' . ltrim($relative_url_path, '/'));
+        abort(404);
     }
 
     public function copyHrSellListReport($report_id, Request $request)

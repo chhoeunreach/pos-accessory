@@ -89,9 +89,7 @@
                     <div class="sell-list-photo-grid">
                         @foreach ($report->photos as $photo)
                             @php
-                                $photoStoragePosition = !empty($photo->photo_url) ? strpos($photo->photo_url, '/storage/') : false;
-                                $photoBaseUrl = $photoStoragePosition !== false ? substr($photo->photo_url, 0, $photoStoragePosition) : rtrim(env('HR_APP_URL', config('app.url')), '/');
-                                $photoUrl = !empty($photo->photo_path) ? $photoBaseUrl . '/storage/' . ltrim($photo->photo_path, '/') : $photo->photo_url;
+                                $photoUrl = $photo->photo_url ?: rtrim(env('HR_APP_URL', config('app.url')), '/') . '/storage/' . ltrim($photo->photo_path, '/');
                                 $ocrPhotoUrl = action([\App\Http\Controllers\SellPosController::class, 'getHrSellListPhoto'], [$photo->id]);
                             @endphp
                             <button type="button" class="sell-list-photo-thumb" data-photo-url="{{ $ocrPhotoUrl }}" data-photo-fallback-url="{{ $photoUrl }}" data-photo-name="{{ $photo->original_name ?: 'Photo' }}">
