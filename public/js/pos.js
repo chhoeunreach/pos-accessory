@@ -2276,7 +2276,7 @@ $(document).ready(function() {
                 $btn.prop('disabled', false).text('Add to');
                 get_hr_sell_list();
                 if (errors.length) {
-                    toastr.warning(done + ' added, ' + errors.length + ' errors.');
+                    toastr.warning(done + ' added, ' + errors.length + ' errors. ' + errors[0]);
                 } else {
                     toastr.success('All ' + total + ' marked as added.');
                 }

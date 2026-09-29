@@ -991,7 +991,7 @@ class SellPosController extends Controller
             }
         }
 
-        return null;
+        return !empty($line->id) ? 'HR-LINE-' . $line->id : null;
     }
 
     private function resolveHrLineVariationId($line, $serial)
@@ -1120,7 +1120,16 @@ class SellPosController extends Controller
             return ['success' => 0, 'msg' => ($serial ?: 'Serial') . ' is already ' . $existing->status . '.', 'line_id' => $line_id];
         }
 
-        $this->setHrSerialStatus($line, 'added', $invoice_key, null, 'manually_added');
+        try {
+            $this->setHrSerialStatus($line, 'added', $invoice_key, null, 'manually_added');
+        } catch (\Exception $e) {
+            \Log::error('Unable to add HR Sell List line.', [
+                'line_id' => $line_id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return ['success' => 0, 'msg' => 'Unable to mark this item as added. Please try again.'];
+        }
 
         return ['success' => 1, 'line_id' => $line_id];
     }
