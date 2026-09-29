@@ -360,6 +360,7 @@ class SellPosController extends Controller
         $location_name = trim((string) $location->name);
         $code = $location->location_id;
         $group = config("hr.location_group_map.{$code}");
+        $mappedBranch = is_array($group) ? ($group[0] ?? '') : (is_string($group) ? $group : '');
         $mappedSellType = is_array($group) ? ($group[1] ?? '') : '';
 
         $branchFromLocationName = $this->resolveHrBranchNameFromLocationName($location_name);
@@ -368,18 +369,23 @@ class SellPosController extends Controller
             return [$branchFromLocationName, $mappedSellType];
         }
 
-        if (!empty($location_name)) {
-            $cache[$location_id] = [$location_name, $mappedSellType];
-            return [$location_name, $mappedSellType];
+        if (!empty($mappedBranch)) {
+            $cache[$location_id] = [$mappedBranch, $mappedSellType];
+            return [$mappedBranch, $mappedSellType];
         }
 
-        if (is_array($group) && count($group) >= 2) {
-            $cache[$location_id] = [$group[0], $group[1]];
-            return [$group[0], $group[1]];
+        $branchFromFirstPart = $this->resolveHrBranchNameFromLocationName(
+            trim(explode('-', $location_name, 2)[0] ?? '')
+        );
+        if (!empty($branchFromFirstPart)) {
+            $cache[$location_id] = [$branchFromFirstPart, $mappedSellType];
+            return [$branchFromFirstPart, $mappedSellType];
         }
-        if (is_string($group) && $group !== '') {
-            $cache[$location_id] = [$group, ''];
-            return [$group, ''];
+
+        if (!empty($location_name)) {
+            $branchName = trim(explode('-', $location_name, 2)[0] ?? $location_name);
+            $cache[$location_id] = [$branchName, $mappedSellType];
+            return [$branchName, $mappedSellType];
         }
 
         $cache[$location_id] = [$location_name, ''];
@@ -391,6 +397,10 @@ class SellPosController extends Controller
         if (empty($location_name)) {
             return '';
         }
+
+        $location_name = trim((string) $location_name);
+        $locationBranchPart = trim(explode('-', $location_name, 2)[0] ?? $location_name);
+        $normalizedLocationBranchPart = preg_replace('/^សាខា/u', '', $locationBranchPart);
 
         $candidateBranches = collect(config('hr.location_group_map', []))
             ->map(function ($entry) {
@@ -410,6 +420,10 @@ class SellPosController extends Controller
             }
 
             if ($location_name === $branchName || str_starts_with($location_name, $branchName) || str_starts_with($branchName, $location_name)) {
+                return $branchName;
+            }
+
+            if ($locationBranchPart === $branchName || $normalizedLocationBranchPart === $branchName) {
                 return $branchName;
             }
         }
