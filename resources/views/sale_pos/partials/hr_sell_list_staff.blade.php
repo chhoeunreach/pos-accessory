@@ -3,6 +3,10 @@
     $addedReports = $hr_sell_out_reports->filter(fn ($report) => !empty($report->has_added_lines));
     $defaultDateFrom = $default_date_from ?? \Carbon\Carbon::now()->format('Y-m-d');
     $defaultDateTo = $default_date_to ?? \Carbon\Carbon::now()->format('Y-m-d');
+    $defaultSellType = $default_sell_type ?? 'លក់';
+    $materialSellTypes = ['Material', 'material', 'សម្ភារ'];
+    $hasMaterialSellType = in_array($defaultSellType, $materialSellTypes)
+        || collect($sell_types ?? [])->contains(fn ($type) => in_array($type, $materialSellTypes));
 @endphp
 
 <div class="sell-list-filter-toggle">
@@ -44,11 +48,14 @@
         <div class="sell-list-filter-field">
             <label>Sell Type</label>
             <select class="sell-list-filter-sell-type form-control">
-                <option value="លក់">Sell / លក់</option>
+                <option value="លក់" {{ in_array($defaultSellType, ['sell', 'លក់']) ? 'selected' : '' }}>Sell / លក់</option>
+                @if ($hasMaterialSellType)
+                    <option value="សម្ភារ" {{ in_array($defaultSellType, $materialSellTypes) ? 'selected' : '' }}>Material / សម្ភារ</option>
+                @endif
                 @if (!empty($sell_types))
                     @foreach ($sell_types as $type)
-                        @if (!in_array($type, ['sell', 'លក់']))
-                            <option value="{{ $type }}">{{ $type }}</option>
+                        @if (!in_array($type, array_merge(['sell', 'លក់'], $materialSellTypes)))
+                            <option value="{{ $type }}" {{ $type === $defaultSellType ? 'selected' : '' }}>{{ $type }}</option>
                         @endif
                     @endforeach
                 @endif

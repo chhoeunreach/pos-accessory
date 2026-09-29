@@ -621,6 +621,7 @@ class SellPosController extends Controller
 
         $default_date_from = $date_from;
         $default_date_to = $date_to;
+        $default_sell_type = $sell_type;
         $sell_types = collect();
         if (!empty($branch_name)) {
             $sell_types = $this->getHrSellListServiceTypes(null, $branch_name);
@@ -642,6 +643,7 @@ class SellPosController extends Controller
             'sell_types' => $sell_types,
             'default_date_from' => $default_date_from,
             'default_date_to' => $default_date_to,
+            'default_sell_type' => $default_sell_type,
             'has_more' => $has_more,
             'page' => $page,
             'per_page' => $per_page,
