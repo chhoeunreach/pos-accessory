@@ -2,7 +2,7 @@
     "Ecommerce": true,
     "HrSellManagement": true,
     "LoanManagement": true,
-    "LocalCashierReport": false,
+    "LocalCashierReport": true,
     "NotificationCenter": true,
     "SmartStockInventory": true,
     "Superadmin": true,
