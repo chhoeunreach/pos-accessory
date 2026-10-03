@@ -17,6 +17,7 @@ return [
         'invoice_count' => 'Invoice Count',
         'sold_quantity' => 'Sold Quantity',
     ],
+    'include_external_database_sources' => env('LOCAL_CASHIER_INCLUDE_EXTERNAL_DATABASE_SOURCES', false),
     'khmer_font_family' => "'KhmerFont', 'Noto Sans Khmer', 'Khmer OS', 'Battambang', sans-serif",
     'all_sale_static_payment_columns' => [
         ['key' => 'cash',         'label' => 'Cash',     'source_methods' => ['cash']],

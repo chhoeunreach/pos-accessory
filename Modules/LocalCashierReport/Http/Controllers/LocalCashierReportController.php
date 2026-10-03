@@ -112,6 +112,10 @@ class LocalCashierReportController extends Controller
             ->orderBy('name')
             ->get(['id', 'name']);
 
+        if (! $this->includeExternalDatabaseSources()) {
+            return $locations;
+        }
+
         $moduleLocations = collect()
             ->merge($this->getModuleLocationsWithSales(
                 (string) config('accessory.database_connection', 'accessory'),
@@ -330,12 +334,14 @@ class LocalCashierReportController extends Controller
             $methodsWithAmount[$method] = true;
         }
 
-        foreach ([
-            (string) config('accessory.database_connection', 'accessory'),
-            (string) config('service.database_connection', 'service'),
-        ] as $moduleConnection) {
-            foreach ($this->getModulePaymentMethodsWithAmount($moduleConnection, $filters) as $method) {
-                $methodsWithAmount[$method] = true;
+        if ($this->includeExternalDatabaseSources()) {
+            foreach ([
+                (string) config('accessory.database_connection', 'accessory'),
+                (string) config('service.database_connection', 'service'),
+            ] as $moduleConnection) {
+                foreach ($this->getModulePaymentMethodsWithAmount($moduleConnection, $filters) as $method) {
+                    $methodsWithAmount[$method] = true;
+                }
             }
         }
 
@@ -811,22 +817,26 @@ class LocalCashierReportController extends Controller
         }
 
         $expenseDetailResult = $this->getExpenseDetailRows($expenseTxnIds, $paymentTypes, $paymentColumns, self::DETAIL_ROW_LIMIT);
-        $accessorySaleDetailResult = $this->getModuleSaleDetailRows(
-            (string) config('accessory.database_connection', 'accessory'),
-            'accessory',
-            $filters,
-            $paymentColumns,
-            self::DETAIL_ROW_LIMIT
-        );
-        $serviceSaleDetailResult = $this->getModuleSaleDetailRows(
-            (string) config('service.database_connection', 'service'),
-            'service',
-            $filters,
-            $paymentColumns,
-            self::DETAIL_ROW_LIMIT
-        );
+        $accessorySaleDetailResult = ['rows' => [], 'total' => 0];
+        $serviceSaleDetailResult = ['rows' => [], 'total' => 0];
+        if ($this->includeExternalDatabaseSources()) {
+            $accessorySaleDetailResult = $this->getModuleSaleDetailRows(
+                (string) config('accessory.database_connection', 'accessory'),
+                'accessory',
+                $filters,
+                $paymentColumns,
+                self::DETAIL_ROW_LIMIT
+            );
+            $serviceSaleDetailResult = $this->getModuleSaleDetailRows(
+                (string) config('service.database_connection', 'service'),
+                'service',
+                $filters,
+                $paymentColumns,
+                self::DETAIL_ROW_LIMIT
+            );
+        }
 
-        $accessorySaleSummaryRows = $accessorySaleDetailResult['total'] > count($accessorySaleDetailResult['rows'])
+        $accessorySaleSummaryRows = $this->includeExternalDatabaseSources() && $accessorySaleDetailResult['total'] > count($accessorySaleDetailResult['rows'])
             ? $this->getModuleSaleDetailRows(
                 (string) config('accessory.database_connection', 'accessory'),
                 'accessory',
@@ -835,7 +845,7 @@ class LocalCashierReportController extends Controller
                 null
             )['rows']
             : $accessorySaleDetailResult['rows'];
-        $serviceSaleSummaryRows = $serviceSaleDetailResult['total'] > count($serviceSaleDetailResult['rows'])
+        $serviceSaleSummaryRows = $this->includeExternalDatabaseSources() && $serviceSaleDetailResult['total'] > count($serviceSaleDetailResult['rows'])
             ? $this->getModuleSaleDetailRows(
                 (string) config('service.database_connection', 'service'),
                 'service',
@@ -1928,6 +1938,10 @@ class LocalCashierReportController extends Controller
             return $empty;
         }
 
+        if (! $this->includeExternalDatabaseSources()) {
+            return $empty;
+        }
+
         if (! $this->loanTableExists('loan_payments') || ! $this->loanTableExists('loans')) {
             return $empty;
         }
@@ -2150,6 +2164,11 @@ class LocalCashierReportController extends Controller
         } catch (\Throwable $e) {
             return false;
         }
+    }
+
+    private function includeExternalDatabaseSources(): bool
+    {
+        return (bool) config('localcashierreport.include_external_database_sources', false);
     }
 
     private function resolveCustomerPhone($contactMobile, $staffNote): string
